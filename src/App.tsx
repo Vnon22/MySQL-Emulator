@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { loadState, resetDatabase, executeQuery } from './sqlEngine';
 import type { DatabaseState, QueryResult } from './types';
+import logo from './assets/ExamFriendly_logo.png';
 import './App.css';
 
 interface HistoryEntry {
@@ -52,19 +53,20 @@ function App() {
         setHistoryIndex(-1);
         setInput('');
       }
-    } else if (e.key === 'Enter' && !e.shiftKey) {
+    } else if (e.key === 'Enter') {
       e.preventDefault();
-      formRef.current?.requestSubmit();
-    } else if (e.key === 'Enter' && e.shiftKey) {
-      e.preventDefault();
-      const inputEl = e.target as HTMLInputElement;
-      const cursorPos = inputEl.selectionStart || 0;
-      const newValue = input.slice(0, cursorPos) + '\n' + input.slice(cursorPos);
-      setInput(newValue);
-      setTimeout(() => {
-        inputEl.selectionStart = cursorPos + 1;
-        inputEl.selectionEnd = cursorPos + 1;
-      }, 0);
+      if (e.shiftKey || !input.trim().endsWith(';')) {
+        const inputEl = e.target as HTMLTextAreaElement;
+        const cursorPos = inputEl.selectionStart || 0;
+        const newValue = input.slice(0, cursorPos) + '\n' + input.slice(cursorPos);
+        setInput(newValue);
+        setTimeout(() => {
+          inputEl.selectionStart = cursorPos + 1;
+          inputEl.selectionEnd = cursorPos + 1;
+        }, 0);
+      } else {
+        formRef.current?.requestSubmit();
+      }
     }
   };
 
@@ -208,7 +210,10 @@ const handleSubmit = (e: React.FormEvent) => {
   return (
     <div className="app">
       <header className="header">
-        <h1 className="title">SQL Emulator</h1>
+        <div className="header-left">
+          <img src={logo} alt="ExamFriendly" className="logo" />
+          <h1 className="title">SQL Emulator</h1>
+        </div>
         <button 
           className={`clear-btn ${clearConfirm ? 'confirm' : ''}`}
           onClick={handleClearDatabase}

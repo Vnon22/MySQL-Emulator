@@ -44,6 +44,17 @@ body {
   flex-shrink: 0;
 }
 
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo {
+  height: 38px;
+  width: auto;
+}
+
 .title {
   font-size: 16px;
   font-weight: 600;
