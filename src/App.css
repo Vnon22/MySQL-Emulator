@@ -114,6 +114,28 @@ body {
   word-break: break-all;
 }
 
+.history-command .sql-keyword {
+  color: var(--text-accent);
+  font-weight: 600;
+}
+
+.history-command .sql-function {
+  color: var(--color-success);
+  font-weight: 600;
+}
+
+.history-command .sql-operator {
+  color: #d29922;
+}
+
+.history-command .sql-string {
+  color: #a5d6ff;
+}
+
+.history-command .sql-number {
+  color: #79c0ff;
+}
+
 .prompt {
   color: var(--text-accent);
   font-weight: 500;

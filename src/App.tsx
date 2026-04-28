@@ -4,6 +4,70 @@ import type { DatabaseState, QueryResult } from './types';
 import logo from './assets/ExamFriendly_logo.png';
 import './App.css';
 
+const SQL_KEYWORDS = ['SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'ADD', 'TABLE', 'DATABASE', 'SHOW', 'USE', 'DESCRIBE', 'DESC', 'ORDER BY', 'GROUP BY', 'HAVING', 'LIMIT', 'DISTINCT', 'AS', 'ON', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'OUTER', 'IS', 'NULL', 'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'DEFAULT', 'AUTO_INCREMENT', 'LIKE', 'IN', 'BETWEEN', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'ASC', 'DESC', 'UNION', 'ALL', 'ORDER', 'GROUP'];
+const SQL_FUNCTIONS = ['COUNT', 'MIN', 'MAX', 'SUM', 'AVG', 'CONCAT', 'LENGTH', 'UPPER', 'LOWER', 'SUBSTRING', 'TRIM', 'NOW', 'DATE', 'IFNULL', 'COALESCE'];
+
+function highlightSQL(sql: string): React.ReactNode[] {
+  const result: React.ReactNode[] = [];
+  let remaining = sql;
+  let key = 0;
+
+  const tokenizer = /(\s+)|('[^']*')|(\d+\.?\d*)|([=!<>]=?|!=|<>)|([(),])/gi;
+  let match;
+  let lastIndex = 0;
+
+  while ((match = tokenizer.exec(remaining)) !== null) {
+    if (match.index > lastIndex) {
+      const text = remaining.slice(lastIndex, match.index);
+      const words = text.split(/(\s+)/);
+      for (const word of words) {
+        if (!word.trim()) {
+          result.push(<span key={key++}>{word}</span>);
+        } else {
+          const upperWord = word.toUpperCase();
+          if (SQL_FUNCTIONS.includes(upperWord)) {
+            result.push(<span key={key++} className="sql-function">{word}</span>);
+          } else if (SQL_KEYWORDS.includes(upperWord)) {
+            result.push(<span key={key++} className="sql-keyword">{word}</span>);
+          } else {
+            result.push(<span key={key++}>{word}</span>);
+          }
+        }
+      }
+    }
+
+    const [, whitespace, string, number, operator, punctuation] = match;
+    if (whitespace) result.push(<span key={key++}>{whitespace}</span>);
+    else if (string) result.push(<span key={key++} className="sql-string">{string}</span>);
+    else if (number) result.push(<span key={key++} className="sql-number">{number}</span>);
+    else if (operator) result.push(<span key={key++} className="sql-operator">{operator}</span>);
+    else if (punctuation) result.push(<span key={key++}>{punctuation}</span>);
+
+    lastIndex = tokenizer.lastIndex;
+  }
+
+  if (lastIndex < remaining.length) {
+    const text = remaining.slice(lastIndex);
+    const words = text.split(/(\s+)/);
+    for (const word of words) {
+      if (!word.trim()) {
+        result.push(<span key={key++}>{word}</span>);
+      } else {
+        const upperWord = word.toUpperCase();
+        if (SQL_FUNCTIONS.includes(upperWord)) {
+          result.push(<span key={key++} className="sql-function">{word}</span>);
+        } else if (SQL_KEYWORDS.includes(upperWord)) {
+          result.push(<span key={key++} className="sql-keyword">{word}</span>);
+        } else {
+          result.push(<span key={key++}>{word}</span>);
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
 interface HistoryEntry {
   command: string;
   result: QueryResult;
@@ -17,7 +81,6 @@ function App() {
   const [clearConfirm, setClearConfirm] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const terminalRef = useRef<HTMLDivElement>(null);
-  const formRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {
     const loaded = loadState();
@@ -55,49 +118,38 @@ function App() {
       }
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      if (e.shiftKey || !input.trim().endsWith(';')) {
-        const inputEl = e.target as HTMLTextAreaElement;
-        const cursorPos = inputEl.selectionStart || 0;
-        const newValue = input.slice(0, cursorPos) + '\n' + input.slice(cursorPos);
-        setInput(newValue);
-        setTimeout(() => {
-          inputEl.selectionStart = cursorPos + 1;
-          inputEl.selectionEnd = cursorPos + 1;
-        }, 0);
+      
+      // Debug logging
+      console.log('Enter pressed! Input:', input);
+      
+      const normalized = input.replace(/\n/g, ' ').replace(/\s+/g, ' ').trim();
+      
+      console.log('Normalized:', normalized, 'Has semicolon:', normalized.endsWith(';'));
+      
+      if (!normalized.endsWith(';')) {
+        setInput(input + '\n');
       } else {
-        formRef.current?.requestSubmit();
+        if (normalized.toUpperCase() === 'CLEAR') {
+          setHistory([]);
+          setInput('');
+          setHistoryIndex(-1);
+          return;
+        }
+        const currentState = loadState();
+        const query = normalized.slice(0, -1);
+        
+        console.log('Executing query:', query);
+        
+        const result = executeQuery(query, currentState);
+        
+        console.log('Result:', result);
+        
+        setState(currentState);
+        setHistory(prev => [...prev, { command: input, result }]);
+        setInput('');
+        setHistoryIndex(-1);
       }
     }
-  };
-
-const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim()) return;
-    const upperInput = input.trim().replace(/\s+/g, ' ').toUpperCase();
-    if (upperInput === 'CLEAR') {
-      setHistory([]);
-      setInput('');
-      setHistoryIndex(-1);
-      return;
-    }
-    if (upperInput === 'CLEAR DATABASES') {
-      return;
-    }
-    if (!input.trim().endsWith(';')) {
-      const result: QueryResult = { type: 'error', error: "Syntax error: Query must end with semicolon (;)" };
-      setHistory(prev => [...prev, { command: input, result }]);
-      setInput('');
-      setHistoryIndex(-1);
-      return;
-    }
-    const currentState = loadState();
-    const query = input.trim().slice(0, -1).replace(/\s+/g, ' ');
-    const result = executeQuery(query, currentState);
-    const newState = loadState();
-    setState(newState);
-    setHistory(prev => [...prev, { command: input, result }]);
-    setInput('');
-    setHistoryIndex(-1);
   };
 
   const handleClearDatabase = () => {
@@ -227,14 +279,14 @@ const handleSubmit = (e: React.FormEvent) => {
             <div key={i} className="history-entry">
               <div className="history-command">
                 <span className="prompt">MariaDB [{dbName}]&gt; </span>
-                <span style={{ whiteSpace: 'pre-wrap' }}>{entry.command}</span>
+                <span style={{ whiteSpace: 'pre-wrap' }}>{highlightSQL(entry.command)}</span>
               </div>
               <div className="history-result">
                 {renderTable(entry.result)}
               </div>
             </div>
           ))}
-          <form ref={formRef} onSubmit={handleSubmit} className="input-line">
+          <form onSubmit={(e) => e.preventDefault()} className="input-line">
             <span className="prompt">MariaDB [{dbName}]&gt; </span>
             <textarea
               ref={inputRef as any}

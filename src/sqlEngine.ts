@@ -84,11 +84,41 @@ function parseInsert(sql: string): { tableName: string; columns: string[]; value
 }
 
 function parseSelect(sql: string): { columns: string | string[]; table: string; where?: string } | null {
-  const match = sql.match(/SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?$/i);
+  // Remove leading/trailing whitespace first
+  const cleanSql = sql.trim();
+  
+  // Try regex with $ anchor at end
+  let match = cleanSql.match(/SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?$/i);
+  
+  // If fails, try alternate approach (for safety) - use .* instead of .+
+  if (!match) {
+    match = cleanSql.match(/SELECT\s+(.*?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?$/i);
+  }
+  
+  // Last resort - more flexible matching
+  if (!match) {
+    const fromIndex = cleanSql.toUpperCase().indexOf('FROM');
+    if (fromIndex === -1) return null;
+    
+    const selectIndex = cleanSql.toUpperCase().indexOf('SELECT');
+    const selectPart = cleanSql.substring(selectIndex + 6, fromIndex).trim();
+    const columns = selectPart === '*' ? '*' : selectPart.split(',').map(c => c.trim());
+    
+    const tablePart = cleanSql.substring(fromIndex + 4).trim().split(/\s/)[0];
+    if (!tablePart) return null;
+    
+    const whereIndex = cleanSql.toUpperCase().indexOf('WHERE');
+    const where = whereIndex !== -1 ? cleanSql.substring(whereIndex + 5).trim() : undefined;
+    
+    return { columns, table: tablePart, where };
+  }
+  
   if (!match) return null;
-  const columns = match[1] === '*' ? '*' : match[1].split(',').map(c => c.trim());
+  
+  const columns = match[1].trim() === '*' ? '*' : match[1].split(',').map(c => c.trim());
   const table = match[2];
   const where = match[3];
+  
   return { columns, table, where };
 }
 
@@ -119,22 +149,82 @@ function parseDelete(sql: string): { table: string; where?: string } | null {
 }
 
 function matchRow(row: Record<string, unknown>, where?: string): boolean {
-  if (!where) return true;
+  if (!where || where.trim() === '') return true;
+  
   try {
-    const condition = where.replace(/(\w+)\s*(=|!=|<>|<|>|>=|<=)\s*('(?:[^']|'')*'|\d+\.?\d*|\w+)/gi, (_, col, op, val) => {
-      let v = val;
-      if (/^'/.test(val)) {
-        v = "'" + val.slice(1, -1) + "'";
-      } else if (/^\d+\.?\d*$/.test(val)) {
-        v = val;
-      } else {
-        v = String(val);
+    // Split by AND/OR to handle compound conditions
+    const tokens = where.split(/\b(AND|OR)\b/i);
+    
+    let result = true;
+    let lastOp = 'AND';
+    
+    for (const token of tokens) {
+      const trimmed = token.trim().toUpperCase();
+      if (trimmed === 'AND') {
+        lastOp = 'AND';
+        continue;
+      } else if (trimmed === 'OR') {
+        lastOp = 'OR';
+        continue;
       }
-      return col + " " + op + " " + v;
-    });
-    const func = new Function("row", "return " + condition);
-    return func(row);
-  } catch {
+      
+      // Parse this condition: column = value or column > value etc
+      const condMatch = token.match(/\s*(\w+)\s*(=|!=|<>|<|>|>=|<=)\s*(.+)/);
+      if (!condMatch) continue;
+      
+      const colName = condMatch[1];
+      const operator = condMatch[2];
+      let compareValue: string | number = condMatch[3].trim();
+      let isNumber = false;
+      
+      // Check if compare value is a number
+      if (/^-?\d+\.?\d*$/.test(compareValue)) {
+        compareValue = parseFloat(compareValue);
+        isNumber = true;
+      } else if (/^'([^']*)'$/.test(compareValue)) {
+        compareValue = compareValue.slice(1, -1);
+      }
+      
+      const rowValue = row[colName];
+      
+      // Compare based on type
+      let condResult = false;
+      if (rowValue === undefined || rowValue === null) {
+        condResult = false;
+      } else if (isNumber) {
+        const numRow = Number(rowValue);
+        const numCompare = Number(compareValue);
+        switch (operator) {
+          case '=': condResult = numRow === numCompare; break;
+          case '!=': case '<>': condResult = numRow !== numCompare; break;
+          case '<': condResult = numRow < numCompare; break;
+          case '>': condResult = numRow > numCompare; break;
+          case '<=': condResult = numRow <= numCompare; break;
+          case '>=': condResult = numRow >= numCompare; break;
+        }
+      } else {
+        const strRow = String(rowValue).toLowerCase();
+        const strCompare = String(compareValue).toLowerCase();
+        switch (operator) {
+          case '=': condResult = strRow === strCompare; break;
+          case '!=': case '<>': condResult = strRow !== strCompare; break;
+          default: condResult = strRow === strCompare;
+        }
+      }
+      
+      // Combine with last operator
+      if (tokens.indexOf(token) === 0 || (tokens.indexOf(token) === 1 && tokens[0].trim() === '')) {
+        result = condResult;
+      } else if (lastOp === 'AND') {
+        result = result && condResult;
+      } else {
+        result = result || condResult;
+      }
+    }
+    
+    return result;
+  } catch (e) {
+    console.error("matchRow error:", e, "where:", where);
     return false;
   }
 }
@@ -145,14 +235,6 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
     return { type: 'ok', message: '' };
   }
   const upperSql = trimmed.toUpperCase();
-  if (upperSql === 'SHOW DATABASES') {
-    const dbNames = Object.keys(state.databases);
-    return {
-      type: 'show_databases',
-      columns: ['Database'],
-      rows: dbNames.map(name => ({ Database: name })),
-    };
-  }
   if (upperSql.startsWith('CREATE DATABASE')) {
     const match = trimmed.match(/CREATE\s+DATABASE\s+(\w+)/i);
     if (!match) {
@@ -333,11 +415,71 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
     if (where) {
       filteredRows = table.rows.filter(row => matchRow(row, where));
     }
+    // Convert columns to array - handle '*' case properly
+    const columnsArray = columns === '*' ? table.columns.map(c => c.name) : (columns as string[]);
+    
+    const hasAggregate = columnsArray.some((col: string) => {
+      const upperCol = col.toUpperCase();
+      return ['COUNT', 'MIN', 'MAX', 'SUM', 'AVG'].includes(upperCol);
+    });
+    if (hasAggregate && columnsArray.length === 1) {
+      const col = columnsArray[0];
+      const upperCol = col.toUpperCase();
+      if (upperCol === 'COUNT(*)') {
+        return { type: 'select', columns: ['COUNT(*)'], rows: [{ 'COUNT(*)': filteredRows.length }] };
+      }
+      if (upperCol.startsWith('COUNT(')) {
+        const columnName = col.match(/COUNT\((\w+)\)/i)?.[1];
+        if (columnName) {
+          const values = filteredRows.map(r => r[columnName]).filter(v => v !== null && v !== undefined);
+          return { type: 'select', columns: [col], rows: [{ [col]: values.length }] };
+        }
+      }
+      if (upperCol.startsWith('MIN(')) {
+        const columnName = col.match(/MIN\((\w+)\)/i)?.[1];
+        if (columnName) {
+          const values = filteredRows.map(r => r[columnName]).filter(v => typeof v === 'number');
+          return { type: 'select', columns: [col], rows: [{ [col]: values.length > 0 ? Math.min(...values) : null }] };
+        }
+      }
+      if (upperCol.startsWith('MAX(')) {
+        const columnName = col.match(/MAX\((\w+)\)/i)?.[1];
+        if (columnName) {
+          const values = filteredRows.map(r => r[columnName]).filter(v => typeof v === 'number');
+          return { type: 'select', columns: [col], rows: [{ [col]: values.length > 0 ? Math.max(...values) : null }] };
+        }
+      }
+      if (upperCol.startsWith('SUM(')) {
+        const columnName = col.match(/SUM\((\w+)\)/i)?.[1];
+        if (columnName) {
+          const values = filteredRows.map(r => r[columnName]).filter(v => typeof v === 'number');
+          const sum = values.reduce((a: number, b: number) => a + b, 0);
+          return { type: 'select', columns: [col], rows: [{ [col]: sum }] };
+        }
+      }
+      if (upperCol.startsWith('AVG(')) {
+        const columnName = col.match(/AVG\((\w+)\)/i)?.[1];
+        if (columnName) {
+          const values = filteredRows.map(r => r[columnName]).filter(v => typeof v === 'number');
+          const avg = values.length > 0 ? values.reduce((a: number, b: number) => a + b, 0) / values.length : null;
+          return { type: 'select', columns: [col], rows: [{ [col]: avg }] };
+        }
+      }
+    }
     const outputRows = filteredRows.map(row => {
-      if (columns === '*') return row;
       const output: Record<string, unknown> = {};
-      (columns as string[]).forEach(col => {
-        output[col] = row[col];
+      columnsArray.forEach(col => {
+        const upperCol = col.toUpperCase();
+        if (upperCol.startsWith('COUNT(') || upperCol.startsWith('MIN(') || upperCol.startsWith('MAX(') || upperCol.startsWith('SUM(') || upperCol.startsWith('AVG(')) {
+          const columnName = col.match(/\((\w+)\)/i)?.[1];
+          if (columnName && row[columnName] !== undefined) {
+            output[col] = row[columnName];
+          } else {
+            output[col] = col;
+          }
+        } else {
+          output[col] = row[col];
+        }
       });
       return output;
     });
