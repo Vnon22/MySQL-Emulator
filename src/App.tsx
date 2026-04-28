@@ -12,6 +12,7 @@ function App() {
   const [state, setState] = useState<DatabaseState>({ databases: {}, currentDatabase: null });
   const [input, setInput] = useState('');
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
   const [clearConfirm, setClearConfirm] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const terminalRef = useRef<HTMLDivElement>(null);
@@ -31,6 +32,28 @@ function App() {
     inputRef.current?.focus();
   }, []);
 
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (history.length === 0) return;
+      if (historyIndex < history.length - 1) {
+        const newIndex = historyIndex + 1;
+        setHistoryIndex(newIndex);
+        setInput(history[history.length - 1 - newIndex].command);
+      }
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (historyIndex > 0) {
+        const newIndex = historyIndex - 1;
+        setHistoryIndex(newIndex);
+        setInput(history[history.length - 1 - newIndex].command);
+      } else if (historyIndex === 0) {
+        setHistoryIndex(-1);
+        setInput('');
+      }
+    }
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim()) return;
@@ -38,6 +61,7 @@ function App() {
     if (upperInput === 'CLEAR') {
       setHistory([]);
       setInput('');
+      setHistoryIndex(-1);
       return;
     }
     const currentState = loadState();
@@ -46,6 +70,7 @@ function App() {
     setState(newState);
     setHistory(prev => [...prev, { command: input, result }]);
     setInput('');
+    setHistoryIndex(-1);
   };
 
   const handleClearDatabase = () => {
@@ -186,6 +211,7 @@ function App() {
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
               className="command-input"
               spellCheck={false}
             />
