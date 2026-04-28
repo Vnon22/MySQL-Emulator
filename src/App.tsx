@@ -16,6 +16,7 @@ function App() {
   const [clearConfirm, setClearConfirm] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const terminalRef = useRef<HTMLDivElement>(null);
+  const formRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {
     const loaded = loadState();
@@ -51,21 +52,45 @@ function App() {
         setHistoryIndex(-1);
         setInput('');
       }
+    } else if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      formRef.current?.requestSubmit();
+    } else if (e.key === 'Enter' && e.shiftKey) {
+      e.preventDefault();
+      const inputEl = e.target as HTMLInputElement;
+      const cursorPos = inputEl.selectionStart || 0;
+      const newValue = input.slice(0, cursorPos) + '\n' + input.slice(cursorPos);
+      setInput(newValue);
+      setTimeout(() => {
+        inputEl.selectionStart = cursorPos + 1;
+        inputEl.selectionEnd = cursorPos + 1;
+      }, 0);
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim()) return;
-    const upperInput = input.trim().toUpperCase();
+    const upperInput = input.trim().replace(/\s+/g, ' ').toUpperCase();
     if (upperInput === 'CLEAR') {
       setHistory([]);
       setInput('');
       setHistoryIndex(-1);
       return;
     }
+    if (upperInput === 'CLEAR DATABASES') {
+      return;
+    }
+    if (!input.trim().endsWith(';')) {
+      const result: QueryResult = { type: 'error', error: "Syntax error: Query must end with semicolon (;)" };
+      setHistory(prev => [...prev, { command: input, result }]);
+      setInput('');
+      setHistoryIndex(-1);
+      return;
+    }
     const currentState = loadState();
-    const result = executeQuery(input, currentState);
+    const query = input.trim().slice(0, -1).replace(/\s+/g, ' ');
+    const result = executeQuery(query, currentState);
     const newState = loadState();
     setState(newState);
     setHistory(prev => [...prev, { command: input, result }]);
@@ -197,23 +222,23 @@ function App() {
             <div key={i} className="history-entry">
               <div className="history-command">
                 <span className="prompt">MariaDB [{dbName}]&gt; </span>
-                {entry.command}
+                <span style={{ whiteSpace: 'pre-wrap' }}>{entry.command}</span>
               </div>
               <div className="history-result">
                 {renderTable(entry.result)}
               </div>
             </div>
           ))}
-          <form onSubmit={handleSubmit} className="input-line">
+          <form ref={formRef} onSubmit={handleSubmit} className="input-line">
             <span className="prompt">MariaDB [{dbName}]&gt; </span>
-            <input
-              ref={inputRef}
-              type="text"
+            <textarea
+              ref={inputRef as any}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               className="command-input"
               spellCheck={false}
+              style={{ minHeight: '21px', height: input.split('\n').length * 21 + 'px' }}
             />
           </form>
         </div>

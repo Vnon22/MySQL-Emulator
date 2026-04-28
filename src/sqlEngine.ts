@@ -140,7 +140,7 @@ function matchRow(row: Record<string, unknown>, where?: string): boolean {
 }
 
 export function executeQuery(sql: string, state: DatabaseState): QueryResult {
-  const trimmed = sql.trim();
+  const trimmed = sql.trim().replace(/\s+/g, ' ');
   if (!trimmed) {
     return { type: 'ok', message: '' };
   }
