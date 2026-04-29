@@ -83,43 +83,59 @@ function parseInsert(sql: string): { tableName: string; columns: string[]; value
   return { tableName, columns, values };
 }
 
-function parseSelect(sql: string): { columns: string | string[]; table: string; where?: string } | null {
-  // Remove leading/trailing whitespace first
+function parseSelect(sql: string): { columns: string | string[]; table: string; where?: string; orderBy?: string; limit?: number } | null {
   const cleanSql = sql.trim();
+  const upperSql = cleanSql.toUpperCase();
   
-  // Try regex with $ anchor at end
-  let match = cleanSql.match(/SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?$/i);
+  const fromIndex = upperSql.indexOf('FROM');
+  if (fromIndex === -1) return null;
   
-  // If fails, try alternate approach (for safety) - use .* instead of .+
-  if (!match) {
-    match = cleanSql.match(/SELECT\s+(.*?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?$/i);
+  const selectPart = cleanSql.substring(6, fromIndex).trim();
+  const columns = selectPart === '*' ? '*' : selectPart.split(',').map(c => c.trim());
+  
+  const afterFrom = cleanSql.substring(fromIndex + 4).trim();
+  const tableMatch = afterFrom.match(/^(\w+)/);
+  if (!tableMatch) return null;
+  const table = tableMatch[1];
+  
+  const remaining = afterFrom.substring(table.length).trim();
+  
+  let where: string | undefined;
+  let orderBy: string | undefined;
+  let limit: number | undefined;
+  
+  const whereIndex = remaining.toUpperCase().indexOf('WHERE');
+  const orderIndex = remaining.toUpperCase().indexOf('ORDER BY');
+  const limitIndex = remaining.toUpperCase().indexOf('LIMIT');
+  
+  if (whereIndex !== -1) {
+    let end = remaining.length;
+    if (orderIndex !== -1) end = Math.min(end, orderIndex);
+    if (limitIndex !== -1) end = Math.min(end, limitIndex);
+    where = remaining.substring(whereIndex + 5, end).trim();
   }
   
-  // Last resort - more flexible matching
-  if (!match) {
-    const fromIndex = cleanSql.toUpperCase().indexOf('FROM');
-    if (fromIndex === -1) return null;
-    
-    const selectIndex = cleanSql.toUpperCase().indexOf('SELECT');
-    const selectPart = cleanSql.substring(selectIndex + 6, fromIndex).trim();
-    const columns = selectPart === '*' ? '*' : selectPart.split(',').map(c => c.trim());
-    
-    const tablePart = cleanSql.substring(fromIndex + 4).trim().split(/\s/)[0];
-    if (!tablePart) return null;
-    
-    const whereIndex = cleanSql.toUpperCase().indexOf('WHERE');
-    const where = whereIndex !== -1 ? cleanSql.substring(whereIndex + 5).trim() : undefined;
-    
-    return { columns, table: tablePart, where };
+  if (orderIndex !== -1) {
+    let end = remaining.length;
+    if (whereIndex !== -1 && whereIndex < orderIndex) {
+      end = remaining.length;
+    } else if (whereIndex !== -1) {
+      end = whereIndex;
+    }
+    if (limitIndex !== -1 && limitIndex > orderIndex) {
+      end = Math.min(end, limitIndex);
+    }
+    const orderPart = remaining.substring(orderIndex + 8, end).trim();
+    if (orderPart) orderBy = orderPart;
   }
   
-  if (!match) return null;
+  if (limitIndex !== -1) {
+    const limitPart = remaining.substring(limitIndex + 6).trim();
+    const limitNum = parseInt(limitPart);
+    if (!isNaN(limitNum)) limit = limitNum;
+  }
   
-  const columns = match[1].trim() === '*' ? '*' : match[1].split(',').map(c => c.trim());
-  const table = match[2];
-  const where = match[3];
-  
-  return { columns, table, where };
+  return { columns, table, where, orderBy, limit };
 }
 
 function parseUpdate(sql: string): { table: string; set: Record<string, unknown>; where?: string } | null {
@@ -151,14 +167,106 @@ function parseDelete(sql: string): { table: string; where?: string } | null {
 function matchRow(row: Record<string, unknown>, where?: string): boolean {
   if (!where || where.trim() === '') return true;
   
+  function matchesPattern(str: string, pattern: string): boolean {
+    const regexPattern = pattern
+      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+      .replace(/%/g, '.*')
+      .replace(/_/g, '.');
+    return new RegExp(`^${regexPattern}$`, 'i').test(str);
+  }
+  
+  function parseValue(val: string): { value: string | number; isNumber: boolean } {
+    if (/^-?\d+\.?\d*$/.test(val)) {
+      return { value: parseFloat(val), isNumber: true };
+    } else if (/^'([^']*)'$/.test(val)) {
+      return { value: val.slice(1, -1), isNumber: false };
+    } else if (/^\(.*\)$/.test(val)) {
+      return { value: val, isNumber: false };
+    }
+    return { value: val, isNumber: false };
+  }
+  
   try {
-    // Split by AND/OR to handle compound conditions
-    const tokens = where.split(/\b(AND|OR)\b/i);
+    function splitConditions(where: string): string[] {
+      const result: string[] = [];
+      let current = '';
+      let parenLevel = 0;
+      let i = 0;
+      
+      while (i < where.length) {
+        const remaining = where.substring(i);
+        
+        if (parenLevel === 0) {
+          if (/^BETWEEN\s+/i.test(remaining)) {
+            const betweenMatch = remaining.match(/^BETWEEN\s+(\d+|'[^']*'?)\s+AND\s+(\d+|'[^']*'?)/i);
+            if (betweenMatch) {
+              result.push(betweenMatch[0].trim());
+              i += betweenMatch[0].length;
+              continue;
+            }
+          }
+          
+          const colBetween = remaining.match(/^(\w+)\s+BETWEEN\s+(\d+|'[^']*'?)\s+AND\s+(\d+|'[^']*'?)/i);
+          if (colBetween) {
+            result.push(colBetween[0].trim());
+            i += colBetween[0].length;
+            continue;
+          }
+          
+          if (/^IN\s*\(/i.test(remaining)) {
+            let end = i + 2;
+            let p = 1;
+            while (end < where.length && p > 0) {
+              if (where[end] === '(') p++;
+              else if (where[end] === ')') p--;
+              end++;
+            }
+            result.push(where.substring(i, end).trim());
+            i = end;
+            continue;
+          }
+          
+          if (/^\bAND\b/i.test(remaining)) {
+            if (current.trim()) {
+              result.push(current.trim());
+            }
+            result.push('AND');
+            i += 3;
+            current = '';
+            continue;
+          }
+          
+          if (/^\bOR\b/i.test(remaining)) {
+            if (current.trim()) {
+              result.push(current.trim());
+            }
+            result.push('OR');
+            i += 2;
+            current = '';
+            continue;
+          }
+        }
+        
+        if (remaining[0] === '(') parenLevel++;
+        else if (remaining[0] === ')') parenLevel--;
+        
+        current += remaining[0];
+        i++;
+      }
+      
+      if (current.trim()) {
+        result.push(current.trim());
+      }
+      
+      return result;
+    }
+    
+    const conditions = splitConditions(where);
     
     let result = true;
     let lastOp = 'AND';
     
-    for (const token of tokens) {
+    for (const token of conditions) {
       const trimmed = token.trim().toUpperCase();
       if (trimmed === 'AND') {
         lastOp = 'AND';
@@ -168,52 +276,100 @@ function matchRow(row: Record<string, unknown>, where?: string): boolean {
         continue;
       }
       
-      // Parse this condition: column = value or column > value etc
-      const condMatch = token.match(/\s*(\w+)\s*(=|!=|<>|<|>|>=|<=)\s*(.+)/);
+      const condMatch = token.match(/\s*(\w+)\s*(=|!=|<>|<|>|>=|<=|LIKE|IN|BETWEEN)\s*(.+)/);
       if (!condMatch) continue;
       
       const colName = condMatch[1];
-      const operator = condMatch[2];
-      let compareValue: string | number = condMatch[3].trim();
-      let isNumber = false;
-      
-      // Check if compare value is a number
-      if (/^-?\d+\.?\d*$/.test(compareValue)) {
-        compareValue = parseFloat(compareValue);
-        isNumber = true;
-      } else if (/^'([^']*)'$/.test(compareValue)) {
-        compareValue = compareValue.slice(1, -1);
-      }
+      const operator = condMatch[2].toUpperCase();
+      let compareValue: string = condMatch[3].trim();
+      let condResult = false;
       
       const rowValue = row[colName];
       
-      // Compare based on type
-      let condResult = false;
-      if (rowValue === undefined || rowValue === null) {
-        condResult = false;
-      } else if (isNumber) {
-        const numRow = Number(rowValue);
-        const numCompare = Number(compareValue);
-        switch (operator) {
-          case '=': condResult = numRow === numCompare; break;
-          case '!=': case '<>': condResult = numRow !== numCompare; break;
-          case '<': condResult = numRow < numCompare; break;
-          case '>': condResult = numRow > numCompare; break;
-          case '<=': condResult = numRow <= numCompare; break;
-          case '>=': condResult = numRow >= numCompare; break;
+      // Handle LIKE
+      if (operator === 'LIKE') {
+        if (rowValue === null || rowValue === undefined) {
+          condResult = false;
+        } else {
+          const pattern = compareValue.replace(/^'|'$/g, '');
+          condResult = matchesPattern(String(rowValue), pattern);
         }
-      } else {
-        const strRow = String(rowValue).toLowerCase();
-        const strCompare = String(compareValue).toLowerCase();
-        switch (operator) {
-          case '=': condResult = strRow === strCompare; break;
-          case '!=': case '<>': condResult = strRow !== strCompare; break;
-          default: condResult = strRow === strCompare;
+      }
+      // Handle IN
+      else if (operator === 'IN') {
+        const valuesStr = compareValue.replace(/^\(|\)$/g, '').trim();
+        const values: (string | number)[] = valuesStr.split(',').map(v => {
+          v = v.trim();
+          if (/^'([^']*)'$/.test(v)) return v.slice(1, -1).toLowerCase();
+          if (/^-?\d+\.?\d*$/.test(v)) return parseFloat(v);
+          return v.toLowerCase();
+        });
+        if (rowValue === null || rowValue === undefined) {
+          condResult = false;
+        } else {
+          const rowVal = typeof rowValue === 'string' ? rowValue.toLowerCase() : rowValue;
+          condResult = values.some(v => {
+            if (typeof v === 'number' && typeof rowVal === 'number') return v === rowVal;
+            if (typeof v === 'string' && typeof rowVal === 'string') return v === rowVal;
+            return false;
+          });
+        }
+      }
+      // Handle BETWEEN
+      else if (operator === 'BETWEEN') {
+        const betweenParts = compareValue.split(/\s+AND\s+/i);
+        if (betweenParts.length === 2) {
+          let v1 = betweenParts[0].trim();
+          let v2 = betweenParts[1].trim();
+          v1 = v1.replace(/^'|'$/g, '');
+          v2 = v2.replace(/^'|'$/g, '');
+          const isNum1 = /^-?\d+\.?\d*$/.test(v1);
+          const isNum2 = /^-?\d+\.?\d*$/.test(v2);
+          if (rowValue === null || rowValue === undefined) {
+            condResult = false;
+          } else if (isNum1 && isNum2) {
+            const num = Number(rowValue);
+            const num1 = parseFloat(v1);
+            const num2 = parseFloat(v2);
+            condResult = num >= num1 && num <= num2;
+          } else {
+            const strVal = String(rowValue).toLowerCase();
+            const str1 = String(v1).toLowerCase();
+            const str2 = String(v2).toLowerCase();
+            condResult = strVal >= str1 && strVal <= str2;
+          }
+        }
+      }
+      // Handle standard operators (=, !=, <, >, <=, >=)
+      else {
+        const { value, isNumber } = parseValue(compareValue);
+        
+        if (rowValue === undefined || rowValue === null) {
+          condResult = false;
+        } else if (isNumber) {
+          const numRow = Number(rowValue);
+          const numCompare = Number(value);
+          switch (operator) {
+            case '=': condResult = numRow === numCompare; break;
+            case '!=': case '<>': condResult = numRow !== numCompare; break;
+            case '<': condResult = numRow < numCompare; break;
+            case '>': condResult = numRow > numCompare; break;
+            case '<=': condResult = numRow <= numCompare; break;
+            case '>=': condResult = numRow >= numCompare; break;
+            default: condResult = numRow === numCompare;
+          }
+        } else {
+          const strRow = String(rowValue).toLowerCase();
+          const strCompare = String(value).toLowerCase();
+          switch (operator) {
+            case '=': condResult = strRow === strCompare; break;
+            case '!=': case '<>': condResult = strRow !== strCompare; break;
+            default: condResult = strRow === strCompare;
+          }
         }
       }
       
-      // Combine with last operator
-      if (tokens.indexOf(token) === 0 || (tokens.indexOf(token) === 1 && tokens[0].trim() === '')) {
+      if (conditions.indexOf(token) === 0 || (conditions.indexOf(token) === 1 && conditions[0].trim() === '')) {
         result = condResult;
       } else if (lastOp === 'AND') {
         result = result && condResult;
@@ -276,6 +432,14 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
     state.currentDatabase = dbName;
     saveState(state);
     return { type: 'ok', message: `Database changed` };
+  }
+  if (upperSql.startsWith('SHOW DATABASES')) {
+    const dbNames = Object.keys(state.databases);
+    return {
+      type: 'show_databases',
+      columns: ['Database'],
+      rows: dbNames.map(name => ({ Database: name })),
+    };
   }
   if (!state.currentDatabase) {
     return { type: 'error', error: 'No database selected. Use USE database_name to select a database.' };
@@ -406,7 +570,7 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
     if (!parsed) {
       return { type: 'error', error: 'Syntax error in SELECT statement' };
     }
-    const { columns, table: tableName, where } = parsed;
+    const { columns, table: tableName, where, orderBy, limit } = parsed;
     const table = currentDb.tables[tableName];
     if (!table) {
       return { type: 'error', error: `Table '${tableName}' doesn't exist` };
@@ -414,6 +578,25 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
     let filteredRows = table.rows;
     if (where) {
       filteredRows = table.rows.filter(row => matchRow(row, where));
+    }
+    if (orderBy) {
+      const isDesc = orderBy.toUpperCase().includes('DESC');
+      const sortCol = orderBy.replace(/\s+DESC\s*$/i, '').replace(/\s+ASC\s*$/i, '').trim();
+      filteredRows = [...filteredRows].sort((a, b) => {
+        const aVal = a[sortCol];
+        const bVal = b[sortCol];
+        if (aVal === null || aVal === undefined) return isDesc ? -1 : 1;
+        if (bVal === null || bVal === undefined) return isDesc ? 1 : -1;
+        if (typeof aVal === 'number' && typeof bVal === 'number') {
+          return isDesc ? bVal - aVal : aVal - bVal;
+        }
+        const aStr = String(aVal).toLowerCase();
+        const bStr = String(bVal).toLowerCase();
+        return isDesc ? bStr.localeCompare(aStr) : aStr.localeCompare(bStr);
+      });
+    }
+    if (limit !== undefined && limit > 0) {
+      filteredRows = filteredRows.slice(0, limit);
     }
     // Convert columns to array - handle '*' case properly
     const columnsArray = columns === '*' ? table.columns.map(c => c.name) : (columns as string[]);
