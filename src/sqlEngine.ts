@@ -1,4 +1,4 @@
-import type { DatabaseState, QueryResult, Column } from './types';
+import type { DatabaseState, QueryResult, Column, Table } from './types';
 
 const STORAGE_KEY = 'sql_emulator_data';
 
@@ -34,12 +34,60 @@ function parseColumnDefinition(def: string): Column | null {
   if (!simpleMatch) return null;
   const rawType = simpleMatch[2].toUpperCase();
   let type: Column['type'] = rawType === 'INTEGER' ? 'INT' : rawType === 'INT' ? 'INT' : rawType === 'VARCHAR' ? 'VARCHAR' : rawType === 'TEXT' ? 'TEXT' : rawType === 'DATE' ? 'DATE' : rawType === 'BOOLEAN' ? 'BOOLEAN' : rawType === 'FLOAT' ? 'FLOAT' : rawType === 'DOUBLE' ? 'DOUBLE' : 'VARCHAR';
-  return {  
+  
+  const col: Column = {  
     name: simpleMatch[1],  
     type,
-    primaryKey: /PRIMARY\s+KEY/i.test(def),  
-    nullable: !/NOT\s+NULL/i.test(def)
+    primaryKey: false,
+    nullable: true,
+    unique: false,
+    autoIncrement: false
   };
+  
+  if (/NOT\s+NULL/i.test(def)) {
+    col.nullable = false;
+  }
+  if (/PRIMARY\s+KEY/i.test(def)) {
+    col.primaryKey = true;
+    col.nullable = false;
+  }
+  if (/UNIQUE/i.test(def)) {
+    col.unique = true;
+  }
+  if (/AUTO_INCREMENT/i.test(def)) {
+    col.autoIncrement = true;
+  }
+  
+  const defaultMatch = def.match(/DEFAULT\s+(?:'([^']*)'|(\d+\.?\d*)|(NULL)|(TRUE)|(FALSE))/i);
+  if (defaultMatch) {
+    if (defaultMatch[1] !== undefined) col.default = defaultMatch[1];
+    else if (defaultMatch[2] !== undefined) col.default = defaultMatch[2];
+    else if (defaultMatch[3] !== undefined) col.default = 'NULL';
+    else if (defaultMatch[4] !== undefined) col.default = 'TRUE';
+    else if (defaultMatch[5] !== undefined) col.default = 'FALSE';
+  }
+  
+  const refMatch = def.match(/REFERENCES\s+(\w+)\s*\(\s*(\w+)\s*\)(?:\s+ON\s+DELETE\s+(CASCADE|SET\s+NULL|RESTRICT|NO\s+ACTION))?(?:\s+ON\s+UPDATE\s+(CASCADE|SET\s+NULL|RESTRICT|NO\s+ACTION))?/i);
+  if (refMatch) {
+    const references: {
+      table: string;
+      column: string;
+      onDelete?: 'CASCADE' | 'SET NULL' | 'RESTRICT' | 'NO ACTION';
+      onUpdate?: 'CASCADE' | 'SET NULL' | 'RESTRICT' | 'NO ACTION';
+    } = {
+      table: refMatch[1],
+      column: refMatch[2]
+    };
+    if (refMatch[3]) {
+      references.onDelete = refMatch[3] as 'CASCADE' | 'SET NULL' | 'RESTRICT' | 'NO ACTION';
+    }
+    if (refMatch[4]) {
+      references.onUpdate = refMatch[4] as 'CASCADE' | 'SET NULL' | 'RESTRICT' | 'NO ACTION';
+    }
+    col.references = references;
+  }
+  
+  return col;
 }
 
 function parseCreateTable(sql: string): { tableName: string; columns: Column[] } | null {
@@ -49,12 +97,30 @@ function parseCreateTable(sql: string): { tableName: string; columns: Column[] }
   const columnsStr = match[2];
   const columnDefs = columnsStr.split(',').map(c => c.trim()).filter(c => c);
   const columns: Column[] = [];
+  
   for (const colDef of columnDefs) {
-    if (/^\w+\s+\w+/i.test(colDef)) {
+    if (/FOREIGN\s+KEY/i.test(colDef)) {
+      const fkMatch = colDef.match(/FOREIGN\s+KEY\s*\(\s*(\w+)\s*\)\s*REFERENCES\s+(\w+)\s*\(\s*(\w+)\s*\)(?:\s+ON\s+DELETE\s+(\w+(?:\s+\w+)?))?(?:\s+ON\s+UPDATE\s+(\w+(?:\s+\w+)?))?/i);
+      if (fkMatch) {
+        const colName = fkMatch[1];
+        const existingCol = columns.find(c => c.name === colName);
+        if (existingCol) {
+          const onDelete = fkMatch[4] ? fkMatch[4] as 'CASCADE' | 'SET NULL' | 'RESTRICT' | 'NO ACTION' : undefined;
+          const onUpdate = fkMatch[5] ? fkMatch[5] as 'CASCADE' | 'SET NULL' | 'RESTRICT' | 'NO ACTION' : undefined;
+          existingCol.references = {
+            table: fkMatch[2],
+            column: fkMatch[3],
+            ...(onDelete && { onDelete }),
+            ...(onUpdate && { onUpdate })
+          };
+        }
+      }
+    } else if (/^\w+\s+\w+/i.test(colDef)) {
       const col = parseColumnDefinition(colDef);
       if (col) columns.push(col);
     }
   }
+  
   return { tableName, columns };
 }
 
@@ -334,6 +400,81 @@ function computeAggregate(func: AggregateFunc, rows: Record<string, unknown>[], 
   }
 }
 
+function validateConstraints(
+  table: Table,
+  row: Record<string, unknown>,
+  state: DatabaseState,
+  excludeRow?: Record<string, unknown>
+): string | null {
+  for (const col of table.columns) {
+    const val = row[col.name];
+    
+    if (!col.nullable && (val === null || val === undefined)) {
+      return `Column '${col.name}' cannot be NULL`;
+    }
+    
+    if (col.primaryKey && val !== null && val !== undefined) {
+      const exists = table.rows.some(r => r !== excludeRow && String(r[col.name]) === String(val));
+      if (exists) {
+        return `PRIMARY KEY constraint failed on column '${col.name}': duplicate value '${val}'`;
+      }
+    }
+    
+    if (col.unique && val !== null && val !== undefined) {
+      const exists = table.rows.some(r => r !== excludeRow && String(r[col.name]) === String(val));
+      if (exists) {
+        return `UNIQUE constraint failed on column '${col.name}': duplicate value '${val}'`;
+      }
+    }
+    
+    if (col.references && val !== null && val !== undefined) {
+      const currentDb = state.databases[state.currentDatabase || ''];
+      if (currentDb) {
+        const refTable = currentDb.tables[col.references.table];
+        if (refTable) {
+          const refExists = refTable.rows.some(r => String(r[col.references!.column]) === String(val));
+          if (!refExists) {
+            return `FOREIGN KEY constraint failed on column '${col.name}': value '${val}' not found in ${col.references.table}.${col.references.column}`;
+          }
+        } else {
+          return `FOREIGN KEY constraint failed: Referenced table '${col.references.table}' not found`;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function applyDefaults(table: Table, row: Record<string, unknown>): void {
+  for (const col of table.columns) {
+    if (row[col.name] === undefined && col.default !== undefined) {
+      if (col.default === 'NULL') {
+        row[col.name] = null;
+      } else if (col.default === 'TRUE') {
+        row[col.name] = true;
+      } else if (col.default === 'FALSE') {
+        row[col.name] = false;
+      } else if (/^\d+\.?\d*$/.test(col.default)) {
+        row[col.name] = Number(col.default);
+      } else {
+        row[col.name] = col.default;
+      }
+    }
+  }
+}
+
+function handleAutoIncrement(table: Table, row: Record<string, unknown>): void {
+  for (const col of table.columns) {
+    if (col.autoIncrement && row[col.name] === undefined) {
+      const existingValues = table.rows
+        .map(r => Number(r[col.name]))
+        .filter(v => !isNaN(v));
+      const maxVal = existingValues.length > 0 ? Math.max(...existingValues) : 0;
+      row[col.name] = maxVal + 1;
+    }
+  }
+}
+
 function extractAlias(aggregateExpr: string): { expr: string; alias?: string } {
   const match = aggregateExpr.match(/^(.+)\s+AS\s+(\w+)$/i);
   if (match) {
@@ -517,6 +658,12 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
       cols.forEach((col, i) => {
         row[col] = valueSet[i];
       });
+      applyDefaults(table, row);
+      handleAutoIncrement(table, row);
+      const error = validateConstraints(table, row, state);
+      if (error) {
+        return { type: 'error', error };
+      }
       table.rows.push(row);
     }
     saveState(state);
@@ -721,6 +868,11 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
     let affected = 0;
     for (const row of table.rows) {
       if (!where || matchRow(row, where)) {
+        const updatedRow = { ...row, ...set };
+        const error = validateConstraints(table, updatedRow, state, row);
+        if (error) {
+          return { type: 'error', error };
+        }
         Object.assign(row, set);
         affected++;
       }
@@ -738,8 +890,35 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
     if (!table) {
       return { type: 'error', error: `Table '${tableName}' doesn't exist` };
     }
+    const rowsToDelete = where ? table.rows.filter(row => matchRow(row, where)) : [...table.rows];
     const originalLength = table.rows.length;
-    table.rows = table.rows.filter(row => !where || matchRow(row, where));
+    
+    for (const row of rowsToDelete) {
+      for (const db of Object.values(state.databases)) {
+        for (const otherTable of Object.values(db.tables)) {
+          if (otherTable.name === tableName) continue;
+          for (const col of otherTable.columns) {
+            if (!col.references) continue;
+            if (col.references.table !== tableName) continue;
+            const refColIndex = table.columns.findIndex(c => c.name === col.references!.column);
+            if (refColIndex === -1) continue;
+            const refValue = row[table.columns[refColIndex].name];
+            
+            if (col.references.onDelete === 'CASCADE') {
+              otherTable.rows = otherTable.rows.filter(r => r[col.name] !== refValue);
+            } else if (col.references.onDelete === 'SET NULL') {
+              for (const otherRow of otherTable.rows) {
+                if (otherRow[col.name] === refValue) {
+                  otherRow[col.name] = null;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    table.rows = table.rows.filter(row => !rowsToDelete.includes(row));
     const affected = originalLength - table.rows.length;
     saveState(state);
     return { type: 'ok', message: `Query OK, ${affected} row(s) affected` };
