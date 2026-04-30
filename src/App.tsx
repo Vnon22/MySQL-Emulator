@@ -177,7 +177,7 @@ function App() {
       const hasRows = result.rows && result.rows.length > 0;
       const dataRows = result.rows || [];
       const cols = result.columns || [];
-      const colWidths = cols.map(col => Math.max(col.length, ...dataRows.map(row => String(row[col] || '').length)));
+      const colWidths = cols.map(col => Math.max(col.length, ...dataRows.map(row => String(row[col] == null ? 'NULL' : row[col]).length)));
       const borderLine = '+' + colWidths.map(w => '-'.repeat(w + 2)).join('+') + '+';
       return (
         <table className="result-table">
@@ -187,7 +187,7 @@ function App() {
             </tr>
             <tr className="header-row">
               {cols.map((col, i) => (
-                <td key={i}>{col}{' '.repeat(colWidths[i] - col.length + 1)}</td>
+                <td key={i}>{col}{' '.repeat(Math.max(0, colWidths[i] - col.length + 1))}</td>
               ))}
             </tr>
             <tr className="border-row">
@@ -196,7 +196,7 @@ function App() {
             {dataRows.map((row, ri) => (
               <tr key={ri} className="data-row">
                 {cols.map((col, ci) => (
-                  <td key={ci}>{String(row[col] || 'NULL')}{' '.repeat(colWidths[ci] - String(row[col] || 'NULL').length + 1)}</td>
+                  <td key={ci}>{String(row[col] == null ? 'NULL' : row[col])}{' '.repeat(Math.max(0, colWidths[ci] - String(row[col] == null ? 'NULL' : row[col]).length + 1))}</td>
                 ))}
               </tr>
             ))}
@@ -219,7 +219,7 @@ function App() {
       const hasRows = result.rows && result.rows.length > 0;
       const dataRows = result.rows || [];
       const cols = result.columns || [];
-      const colWidths = cols.map(col => Math.max(col.length, ...dataRows.map(row => String(row[col] || '').length)));
+      const colWidths = cols.map(col => Math.max(col.length, ...dataRows.map(row => String(row[col] == null ? 'NULL' : row[col]).length)));
       const borderLine = '+' + colWidths.map(w => '-'.repeat(w + 2)).join('+') + '+';
       return (
         <table className="result-table">
@@ -229,7 +229,7 @@ function App() {
             </tr>
             <tr className="header-row">
               {cols.map((col, i) => (
-                <td key={i}>{col}{' '.repeat(colWidths[i] - col.length + 1)}</td>
+                <td key={i}>{col}{' '.repeat(Math.max(0, colWidths[i] - col.length + 1))}</td>
               ))}
             </tr>
             <tr className="border-row">
@@ -238,7 +238,7 @@ function App() {
             {dataRows.map((row, ri) => (
               <tr key={ri} className="data-row">
                 {cols.map((col, ci) => (
-                  <td key={ci}>{String(row[col] || 'NULL')}{' '.repeat(colWidths[ci] - String(row[col] || 'NULL').length + 1)}</td>
+                  <td key={ci}>{String(row[col] == null ? 'NULL' : row[col])}{' '.repeat(Math.max(0, colWidths[ci] - String(row[col] == null ? 'NULL' : row[col]).length + 1))}</td>
                 ))}
               </tr>
             ))}

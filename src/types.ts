@@ -4,7 +4,14 @@ export interface Column {
   primaryKey?: boolean;
   nullable?: boolean;
   autoIncrement?: boolean;
+  unique?: boolean;
   default?: string;
+  references?: {
+    table: string;
+    column: string;
+    onDelete?: 'CASCADE' | 'SET NULL' | 'RESTRICT' | 'NO ACTION';
+    onUpdate?: 'CASCADE' | 'SET NULL' | 'RESTRICT' | 'NO ACTION';
+  };
 }
 
 export interface Table {
