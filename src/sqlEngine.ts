@@ -93,12 +93,14 @@ function parseSelect(sql: string): {
   orderDesc?: boolean[];
   limit?: number;
   offset?: number;
+  distinct?: boolean;
 } | null {
-  const selectMatch = sql.match(/SELECT\s+(.+?)\s+FROM\s+(\w+)/i);
+  const selectMatch = sql.match(/SELECT\s+(DISTINCT\s+)?(.+?)\s+FROM\s+(\w+)/i);
   if (!selectMatch) return null;
   
-  const columnsStr = selectMatch[1];
-  const table = selectMatch[2];
+  const distinct = !!(selectMatch[1]);
+  const columnsStr = selectMatch[2];
+  const table = selectMatch[3];
   const afterFrom = sql.substring(selectMatch[0].length);
   
   let where: string | undefined;
@@ -143,7 +145,7 @@ function parseSelect(sql: string): {
   
   const columns = columnsStr === '*' ? '*' : columnsStr.split(',').map(c => c.trim());
   
-  return { columns, table, where, groupBy, having, orderBy, orderDesc, limit, offset };
+  return { columns, table, where, groupBy, having, orderBy, orderDesc, limit, offset, distinct };
 }
 
 function parseUpdate(sql: string): { table: string; set: Record<string, unknown>; where?: string } | null {
@@ -234,6 +236,18 @@ function matchRow(row: Record<string, unknown>, where?: string): boolean {
     // Handle IS NULL
     condition = condition.replace(/(\w+)\s+IS\s+NULL/gi, 
       (_, col) => `row['${col.toLowerCase()}'] === null || row['${col.toLowerCase()}'] === undefined`);
+    
+    // Handle NOT LIKE
+    condition = condition.replace(/(\w+)\s+NOT\s+LIKE\s+'([^']*)'/gi, (_, col, pattern) => {
+      const regexPattern = pattern.replace(/%/g, '.*').replace(/_/g, '.');
+      return `!(/^${regexPattern}$/i.test(String(row['${col.toLowerCase()}'] || '')))`;
+    });
+    
+    // Handle LIKE
+    condition = condition.replace(/(\w+)\s+LIKE\s+'([^']*)'/gi, (_, col, pattern) => {
+      const regexPattern = pattern.replace(/%/g, '.*').replace(/_/g, '.');
+      return `/(^${regexPattern}$)/i.test(String(row['${col.toLowerCase()}'] || ''))`;
+    });
     
     // Handle operators: replace column names with row['col'] and SQL ops with JS ops
     condition = condition.replace(/(\w+)\s*(=|!=|<>|<|>|>=|<=)\s*('[^']*'|\d+\.?\d*|\w+)/gi, (_, col, op, val) => {
@@ -513,7 +527,7 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
     if (!parsed) {
       return { type: 'error', error: 'Syntax error in SELECT statement' };
     }
-    const { columns, table: tableName, where, groupBy, having, orderBy, orderDesc, limit, offset } = parsed;
+    const { columns, table: tableName, where, groupBy, having, orderBy, orderDesc, limit, offset, distinct } = parsed;
     const table = currentDb.tables[tableName];
     if (!table) {
       return { type: 'error', error: `Table '${tableName}' doesn't exist` };
@@ -647,6 +661,16 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
       outputCols = columnExprs.map(expr => {
         const { alias } = extractAlias(expr);
         return alias || expr;
+      });
+    }
+    
+    if (distinct) {
+      const seen = new Set<string>();
+      resultRows = resultRows.filter(row => {
+        const key = outputCols.map(col => String(row[col] ?? 'NULL')).join('|');
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
       });
     }
     
