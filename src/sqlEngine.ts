@@ -151,7 +151,9 @@ function parseInsert(sql: string): { tableName: string; columns: string[]; value
 
 function parseSelect(sql: string): { 
   columns: string | string[]; 
-  table: string; 
+  table: string;
+  fromClause?: string;
+  joins?: JoinClause[];
   where?: string; 
   groupBy?: string[]; 
   having?: string;
@@ -161,12 +163,18 @@ function parseSelect(sql: string): {
   offset?: number;
   distinct?: boolean;
 } | null {
-  const selectMatch = sql.match(/SELECT\s+(DISTINCT\s+)?(.+?)\s+FROM\s+(\w+)/i);
+  const selectMatch = sql.match(/SELECT\s+(DISTINCT\s+)?(.+?)\s+FROM\s+(.+?)(?=\s+WHERE|\s+GROUP\s+BY|\s+ORDER\s+BY|\s+LIMIT|\s*$)/i);
   if (!selectMatch) return null;
   
   const distinct = !!(selectMatch[1]);
   const columnsStr = selectMatch[2];
-  const table = selectMatch[3];
+  const fromClause = selectMatch[3].trim();
+  
+  const parsedFrom = parseFromClause(fromClause);
+  if (!parsedFrom) return null;
+  
+  const { baseTable, joins } = parsedFrom;
+  const table = baseTable;
   const afterFrom = sql.substring(selectMatch[0].length);
   
   let where: string | undefined;
@@ -211,7 +219,7 @@ function parseSelect(sql: string): {
   
   const columns = columnsStr === '*' ? '*' : columnsStr.split(',').map(c => c.trim());
   
-  return { columns, table, where, groupBy, having, orderBy, orderDesc, limit, offset, distinct };
+  return { columns, table, fromClause, joins, where, groupBy, having, orderBy, orderDesc, limit, offset, distinct };
 }
 
 function parseUpdate(sql: string): { table: string; set: Record<string, unknown>; where?: string } | null {
@@ -316,7 +324,22 @@ function matchRow(row: Record<string, unknown>, where?: string): boolean {
     });
     
     // Handle operators: replace column names with row['col'] and SQL ops with JS ops
-    condition = condition.replace(/(\w+)\s*(=|!=|<>|<|>|>=|<=)\s*('[^']*'|\d+\.?\d*|\w+)/gi, (_, col, op, val) => {
+    // Handle qualified column = qualified column (e.g., users.id = orders.user_id)
+    condition = condition.replace(/(\w+\.\w+)\s*(=|!=|<>|<|>|>=|<=)\s*(\w+\.\w+)/gi, (_, col1, op, col2) => {
+      const jsOp = op === '=' ? '===' : op === '!=' || op === '<>' ? '!==' : op;
+      return `row['${col1.toLowerCase()}'] ${jsOp} row['${col2.toLowerCase()}']`;
+    });
+    // Handle qualified column = value
+    condition = condition.replace(/(\w+\.\w+)\s*(=|!=|<>|<|>|>=|<=)\s*('[^']*'|\d+\.?\d*)/gi, (_, col, op, val) => {
+      let v = val.trim();
+      if (/^'/.test(v)) {
+        v = "'" + v.slice(1, -1).replace(/'/g, "\\'") + "'";
+      }
+      const jsOp = op === '=' ? '===' : op === '!=' || op === '<>' ? '!==' : op;
+      return `row['${col.toLowerCase()}'] ${jsOp} ${v}`;
+    });
+    // Handle simple column = value
+    condition = condition.replace(/(\w+)\s*(=|!=|<>|<|>|>=|<=)\s*('[^']*'|\d+\.?\d*)/gi, (_, col, op, val) => {
       let v = val.trim();
       if (/^'/.test(v)) {
         v = "'" + v.slice(1, -1).replace(/'/g, "\\'") + "'";
@@ -334,6 +357,129 @@ function matchRow(row: Record<string, unknown>, where?: string): boolean {
     console.error('matchRow error:', e, 'where:', where);
     return false;
   }
+}
+
+type JoinType = 'INNER' | 'LEFT' | 'RIGHT' | 'FULL';
+
+interface JoinClause {
+  type: JoinType;
+  table: string;
+  onCondition: string;
+}
+
+function parseFromClause(clause: string): { baseTable: string; joins: JoinClause[] } | null {
+  const trimmed = clause.trim();
+  const baseMatch = trimmed.match(/^(\w+)/);
+  if (!baseMatch) return null;
+  const baseTable = baseMatch[1];
+  let rest = trimmed.slice(baseMatch[0].length).trim();
+  const joins: JoinClause[] = [];
+  while (rest) {
+    const joinMatch = rest.match(/^((?:INNER|LEFT|RIGHT|FULL)\s+)?JOIN\s+(\w+)\s+ON\s+(.+)$/i);
+    if (!joinMatch) break;
+    const joinType = joinMatch[1] ? joinMatch[1].trim().toUpperCase() as JoinType : 'INNER';
+    const joinTable = joinMatch[2];
+    let onCondition = joinMatch[3];
+    const nextJoinMatch = onCondition.match(/\b(?:INNER|LEFT|RIGHT|FULL)\s+JOIN\b/i);
+    if (nextJoinMatch && nextJoinMatch.index !== undefined) {
+      const thisOn = onCondition.substring(0, nextJoinMatch.index).trim();
+      const remaining = onCondition.substring(nextJoinMatch.index).trim();
+      joins.push({ type: joinType, table: joinTable, onCondition: thisOn });
+      rest = remaining;
+    } else {
+      joins.push({ type: joinType, table: joinTable, onCondition: onCondition.trim() });
+      rest = '';
+    }
+  }
+  return { baseTable, joins };
+}
+
+function performJoin(
+  leftRows: Record<string, unknown>[],
+  rightTable: Table,
+  rightTableName: string,
+  joinType: JoinType,
+  onCondition: string
+): Record<string, unknown>[] {
+  const result: Record<string, unknown>[] = [];
+  const rightRows = rightTable.rows;
+  if (joinType === 'INNER' || joinType === 'LEFT') {
+    for (const leftRow of leftRows) {
+      let matched = false;
+      for (const rightRow of rightRows) {
+        const testRow = { ...leftRow };
+        for (const col of rightTable.columns) {
+          testRow[`${rightTableName}.${col.name}`] = rightRow[col.name];
+        }
+        if (matchRow(testRow, onCondition)) {
+          result.push(testRow);
+          matched = true;
+        }
+      }
+      if (!matched && joinType === 'LEFT') {
+        const nullRight: Record<string, unknown> = {};
+        for (const col of rightTable.columns) {
+          nullRight[`${rightTableName}.${col.name}`] = null;
+        }
+        result.push({ ...leftRow, ...nullRight });
+      }
+    }
+  } else if (joinType === 'RIGHT') {
+    for (const rightRow of rightRows) {
+      let matched = false;
+      for (const leftRow of leftRows) {
+        const testRow = { ...leftRow };
+        for (const col of rightTable.columns) {
+          testRow[`${rightTableName}.${col.name}`] = rightRow[col.name];
+        }
+        if (matchRow(testRow, onCondition)) {
+          result.push(testRow);
+          matched = true;
+        }
+      }
+      if (!matched) {
+        const nullLeft: Record<string, unknown> = {};
+        for (const col of rightTable.columns) {
+          nullLeft[`${rightTableName}.${col.name}`] = rightRow[col.name];
+        }
+        result.push({ ...nullLeft });
+      }
+    }
+  } else if (joinType === 'FULL') {
+    const matchedRightIndices = new Set<number>();
+    for (const leftRow of leftRows) {
+      let matched = false;
+      for (let i = 0; i < rightRows.length; i++) {
+        const rightRow = rightRows[i];
+        const testRow = { ...leftRow };
+        for (const col of rightTable.columns) {
+          testRow[`${rightTableName}.${col.name}`] = rightRow[col.name];
+        }
+        if (matchRow(testRow, onCondition)) {
+          result.push(testRow);
+          matched = true;
+          matchedRightIndices.add(i);
+        }
+      }
+      if (!matched) {
+        const nullRight: Record<string, unknown> = {};
+        for (const col of rightTable.columns) {
+          nullRight[`${rightTableName}.${col.name}`] = null;
+        }
+        result.push({ ...leftRow, ...nullRight });
+      }
+    }
+    for (let i = 0; i < rightRows.length; i++) {
+      if (!matchedRightIndices.has(i)) {
+        const nullLeft: Record<string, unknown> = {};
+        for (const col of rightTable.columns) {
+          nullLeft[`${rightTableName}.${col.name}`] = rightRows[i][col.name];
+        }
+        result.push({ ...nullLeft });
+      }
+    }
+  }
+  return result;
 }
 
 type AggregateFunc = 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX';
@@ -674,22 +820,53 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
     if (!parsed) {
       return { type: 'error', error: 'Syntax error in SELECT statement' };
     }
-    const { columns, table: tableName, where, groupBy, having, orderBy, orderDesc, limit, offset, distinct } = parsed;
+    const { columns, table: tableName, joins, where, groupBy, having, orderBy, orderDesc, limit, offset, distinct } = parsed;
     const table = currentDb.tables[tableName];
     if (!table) {
       return { type: 'error', error: `Table '${tableName}' doesn't exist` };
     }
 
-    const expandedColumns = columns === '*' ? table.columns.map(c => c.name) : (typeof columns === 'string' ? [columns] : columns);
+    let joinedRows: Record<string, unknown>[] = [];
+    let allColumns: { table: string; name: string }[] = [];
     
-    let filteredRows = table.rows;
-    if (where) {
-      console.log('Filtering with where:', where);
-      filteredRows = table.rows.filter(row => {
-        const result = matchRow(row, where);
-        console.log('Row match:', { row, where, result });
-        return result;
+    if (joins && joins.length > 0) {
+      joinedRows = table.rows.map(row => {
+        const prefixed: Record<string, unknown> = {};
+        for (const col of table.columns) {
+          prefixed[`${tableName}.${col.name}`] = row[col.name];
+        }
+        return prefixed;
       });
+      allColumns = table.columns.map(col => ({ table: tableName, name: col.name }));
+      
+      for (const join of joins) {
+        const rightTable = currentDb.tables[join.table];
+        if (!rightTable) {
+          return { type: 'error', error: `Table '${join.table}' doesn't exist` };
+        }
+        joinedRows = performJoin(joinedRows, rightTable, join.table, join.type, join.onCondition);
+        allColumns = [...allColumns, ...rightTable.columns.map(col => ({ table: join.table, name: col.name }))];
+      }
+    } else {
+      joinedRows = table.rows;
+      allColumns = table.columns.map(col => ({ table: tableName, name: col.name }));
+    }
+
+    let expandedColumns: string[];
+    if (columns === '*') {
+      expandedColumns = allColumns.map(col => {
+        if (joins && joins.length > 0) {
+          return `${col.table}.${col.name}`;
+        }
+        return col.name;
+      });
+    } else {
+      expandedColumns = typeof columns === 'string' ? [columns] : columns;
+    }
+    
+    let filteredRows = joinedRows;
+    if (where) {
+      filteredRows = joinedRows.filter(row => matchRow(row, where));
     }
     
     let resultRows: Record<string, unknown>[];
@@ -712,7 +889,7 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
       
       const aliasMap: Record<string, string> = {};
       const columnExprs: string[] = expandedColumns;
-       
+        
       for (const colExpr of columnExprs) {
         const { expr, alias } = extractAlias(colExpr);
         if (alias) {
@@ -744,7 +921,7 @@ export function executeQuery(sql: string, state: DatabaseState): QueryResult {
       }
       
       if (having) {
-        const havingMatch = having.match(/^(\w+)\s*(>|<|>=|<=|=|!=|IS NULL|IS NOT NULL)\s*(\d+(?:\.\d+)?)?$/i);
+        const havingMatch = having.match(/^(\w+(?:\.\w+)?)\s*(>|<|>=|<=|=|!=|IS NULL|IS NOT NULL)\s*(\d+(?:\.\d+)?)?$/i);
         if (havingMatch) {
           const col = havingMatch[1];
           const op = havingMatch[2].toUpperCase();
